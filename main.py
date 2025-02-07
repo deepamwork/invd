@@ -3,11 +3,14 @@ import csv
 import re
 import duckdb
 import typer
+import logging
 from tqdm import tqdm
 from ollama import chat
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from pydantic import BaseModel, HttpUrl, EmailStr, field_validator, ValidationError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 app = typer.Typer()
 
@@ -23,6 +26,28 @@ def log_error(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logging.error(f"{timestamp} - {message}")
 
+# Regex-based validation functions
+def validate_phone_number(value: Optional[str]) -> Optional[str]:
+    """Validates phone numbers with a balance between strictness and flexibility."""
+    if value:
+        pattern = re.compile(r"^\+?[0-9\s\-\(\)]{7,20}$")  # Allows country codes, spaces, dashes, and parentheses
+        if not pattern.match(value):
+            return None  # Invalid format
+    return value
+
+def validate_linkedin_url(value: Optional[str]) -> Optional[str]:
+    """Ensures LinkedIn link contains 'linkedin.com'."""
+    if value and "linkedin.com" not in value:
+        return None
+    return value
+
+def validate_x_twitter_url(value: Optional[str]) -> Optional[str]:
+    """Ensures Twitter/X link contains 'twitter.com' or 'x.com'."""
+    if value and not any(domain in value for domain in ["twitter.com", "x.com"]):
+        return None
+    return value
+
+# Define Pydantic model for structured data extraction
 class Company(BaseModel):
     Company_Name: str
     Company_Website: Optional[HttpUrl] = None
