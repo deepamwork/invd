@@ -8,8 +8,10 @@ from tqdm import tqdm
 from ollama import chat
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from pydantic import BaseModel, HttpUrl, EmailStr, field_validator, ValidationError
+from pydantic import BaseModel
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 app = typer.Typer()
 
@@ -25,55 +27,48 @@ def log_error(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logging.error(f"{timestamp} - {message}")
 
+# Regex-based validation functions
+def validate_phone_number(value: Optional[str]) -> Optional[str]:
+    """Validates phone numbers with a balance between strictness and flexibility."""
+    if value:
+        pattern = re.compile(r"^\+?[0-9\s\-\(\)]{7,20}$")  # Allows country codes, spaces, dashes, and parentheses
+        if not pattern.match(value):
+            return None  # Invalid format
+    return value
+
+def validate_linkedin_url(value: Optional[str]) -> Optional[str]:
+    """Ensures LinkedIn link contains 'linkedin.com'."""
+    if value and "linkedin.com" not in value:
+        return None
+    return value
+
+def validate_x_twitter_url(value: Optional[str]) -> Optional[str]:
+    """Ensures Twitter/X link contains 'twitter.com' or 'x.com'."""
+    if value and not any(domain in value for domain in ["twitter.com", "x.com"]):
+        return None
+    return value
+
+def validate_ticket_size(value: Optional[str]) -> Optional[str]:
+    """Ensures ticket size is in a valid format (e.g., $1M, ₹50 Cr, €500K)."""
+    if value:
+        pattern = re.compile(r"^[\$€₹]?[0-9]+(\.[0-9]+)?\s?(M|K|Cr|L|million|thousand)?$", re.IGNORECASE)
+        if not pattern.match(value):
+            return None
+    return value
+
+# Define Pydantic model for structured data extraction
 class Company(BaseModel):
     Company_Name: str
-    Company_Website: Optional[HttpUrl] = None
+    Company_Website: Optional[str] = None
     Company_Location: Optional[str] = None
     Company_Phone_Number: Optional[str] = None
-    Email: Optional[EmailStr] = None
-    LinkedIn_Link: Optional[HttpUrl] = None
+    Email: Optional[str] = None
+    LinkedIn_Link: Optional[str] = None
     Sector: Optional[str] = None
     Ticket_Size: Optional[str] = None
-    X_Twitter_Account_Link: Optional[HttpUrl] = None
+    X_Twitter_Account_Link: Optional[str] = None
     Funding_Round: Optional[str] = None
     Individual_or_Corporation: Optional[str] = None
-
-    @field_validator("Company_Phone_Number")
-    @classmethod
-    def validate_phone_number(cls, value):
-        """Validates and auto-fixes phone numbers."""
-        if value:
-            value = re.sub(r"[^\d+]", "", value)  # Remove non-numeric characters except '+'
-            pattern = re.compile(r"^\+?[0-9]{7,15}$")  # Allows 7-15 digits
-            if not pattern.match(value):
-                raise ValueError("Invalid phone number format")
-        return value
-
-    @field_validator("LinkedIn_Link")
-    @classmethod
-    def validate_linkedin_url(cls, value):
-        """Ensures LinkedIn URL contains 'linkedin.com'."""
-        if value and "linkedin.com" not in str(value):
-            raise ValueError("Invalid LinkedIn URL. Must contain 'linkedin.com'")
-        return value
-
-    @field_validator("X_Twitter_Account_Link")
-    @classmethod
-    def validate_x_twitter_url(cls, value):
-        """Ensures Twitter/X URL contains 'twitter.com' or 'x.com'."""
-        if value and not any(domain in str(value) for domain in ["twitter.com", "x.com"]):
-            raise ValueError("Invalid Twitter/X URL. Must contain 'twitter.com' or 'x.com'")
-        return value
-
-    @field_validator("Ticket_Size")
-    @classmethod
-    def validate_ticket_size(cls, value):
-        """Ensures ticket size is in a valid format (e.g., $1M, ₹50 Cr, €500K)."""
-        if value:
-            pattern = re.compile(r"^[\$€₹]?[0-9]+(\.[0-9]+)?\s?(M|K|Cr|L|million|thousand)?$", re.IGNORECASE)
-            if not pattern.match(value):
-                raise ValueError("Invalid Ticket Size format")
-        return value
 
 class CompanyList(BaseModel):
     companies: List[Company]
@@ -95,7 +90,7 @@ def extract_data_from_row(row) -> Dict[str, Any]:
 
     response = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="llama3.2",  
+        model="deepseek-r1:latest",  
         format=CompanyList.model_json_schema(),  # Request structured JSON output
     )
 
@@ -137,11 +132,13 @@ def process_csv(
         csvfile.seek(0)  # Reset file pointer
         next(csv_reader)  # Skip header again
 
+        lock = Lock()
         with tqdm(total=total_rows, desc="Processing Rows", unit="row") as pbar:
-            for row in csv_reader:
+            def process_row(row):
                 if not any(row):  # Skip empty rows
-                    pbar.update(1)
-                    continue
+                    with lock:
+                        pbar.update(1)
+                    return
 
                 try:
                     structured_data = extract_data_from_row(row)
@@ -149,6 +146,7 @@ def process_csv(
                     structured_data["Company_Phone_Number"] = validate_phone_number(structured_data.get("Company_Phone_Number"))
                     structured_data["LinkedIn_Link"] = validate_linkedin_url(structured_data.get("LinkedIn_Link"))
                     structured_data["X_Twitter_Account_Link"] = validate_x_twitter_url(structured_data.get("X_Twitter_Account_Link"))
+                    structured_data["Ticket_Size"] = validate_ticket_size(structured_data.get("Ticket_Size"))
 
                     valid_data = {k: v for k, v in structured_data.items() if v not in [None, "", "None"]}
 
@@ -171,7 +169,14 @@ def process_csv(
                 except Exception as e:
                     log_error(f"Skipping row due to validation error: {e}\n")
 
-                pbar.update(1)
+                with lock:
+                    pbar.update(1)
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(process_row, row) for row in csv_reader]
+
+                for future in as_completed(futures):
+                    future.result()
 
     # Save extracted data to a CSV file
     conn.execute(f"COPY companies TO '{output_csv}' (HEADER, DELIMITER ',')")
