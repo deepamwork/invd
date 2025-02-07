@@ -9,7 +9,6 @@ from ollama import chat
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from pydantic import BaseModel, HttpUrl, EmailStr, field_validator, ValidationError
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 app = typer.Typer()
@@ -26,28 +25,6 @@ def log_error(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logging.error(f"{timestamp} - {message}")
 
-# Regex-based validation functions
-def validate_phone_number(value: Optional[str]) -> Optional[str]:
-    """Validates phone numbers with a balance between strictness and flexibility."""
-    if value:
-        pattern = re.compile(r"^\+?[0-9\s\-\(\)]{7,20}$")  # Allows country codes, spaces, dashes, and parentheses
-        if not pattern.match(value):
-            return None  # Invalid format
-    return value
-
-def validate_linkedin_url(value: Optional[str]) -> Optional[str]:
-    """Ensures LinkedIn link contains 'linkedin.com'."""
-    if value and "linkedin.com" not in value:
-        return None
-    return value
-
-def validate_x_twitter_url(value: Optional[str]) -> Optional[str]:
-    """Ensures Twitter/X link contains 'twitter.com' or 'x.com'."""
-    if value and not any(domain in value for domain in ["twitter.com", "x.com"]):
-        return None
-    return value
-
-# Define Pydantic model for structured data extraction
 class Company(BaseModel):
     Company_Name: str
     Company_Website: Optional[HttpUrl] = None
@@ -98,62 +75,46 @@ class Company(BaseModel):
                 raise ValueError("Invalid Ticket Size format")
         return value
 
-class PartialCompanyList(BaseModel):
-    """Pydantic Model that accepts valid structured data."""
+class CompanyList(BaseModel):
     companies: List[Company]
 
-def extract_data_from_batch(rows):
-    """Extracts structured information from a batch of CSV rows using Ollama."""
-    raw_data = "\n".join([", ".join(row) for row in rows])
+def extract_data_from_row(row) -> Dict[str, Any]:
+    """Extracts structured information for a single CSV row using Ollama and Pydantic."""
+    raw_data = ", ".join(row)
 
     prompt = f"""
-    You are an intelligent data extractor. Convert the given structured text into JSON format, 
-    ensuring the values match the expected types.
+    Extract the following structured information from the given data.
+    If a column is invalid or missing, leave it blank.
 
-    **Strictly follow this format:**
-    {{
-      "Company_Name": "Company name",
-      "Company_Website": "Company website URL",
-      "Company_Location": "Company location",
-      "Company_Phone_Number": "Company phone number (must be valid)",
-      "Email": "Company email (must be valid)",
-      "LinkedIn_Link": "LinkedIn profile URL (must contain linkedin.com)",
-      "Sector": "Industry sector",
-      "Ticket_Size": "Investment ticket size (e.g., $100K, ₹50 Cr, €500K)",
-      "X_Twitter_Account_Link": "Twitter/X profile URL (must contain twitter.com or x.com)",
-      "Funding_Round": "Investment round (e.g., Seed, Series A, IPO)",
-      "Individual_or_Corporation": "Specify if the entity is an individual or a corporation"
-    }}
+    Headers: "Company Name", "Company Website", "Company Location", "Company Phone Number", "Email",
+    "LinkedIn Link", "Sector", "Ticket Size", "X Twitter Account Link", "Funding Round", "Individual or Corporation"
 
-    ❗ **Important Instructions:**
-    - **Do not change field names**; output must match the expected structure.
-    - **Leave fields blank if data is missing.** Do not add extra fields.
-    - **Ensure data is properly formatted (URLs, emails, phone numbers, currency).**
-    - **Remove duplicates and irrelevant text.**
-
-    **Extracted Data:**
+    Data:
     {raw_data}
     """
 
     response = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="llama3.2",
-        format=PartialCompanyList.model_json_schema(),
+        model="llama3.2",  
+        format=CompanyList.model_json_schema(),  # Request structured JSON output
     )
 
+    # 🛑 Debug: Print the raw response from Ollama
     print("\n🔍 Ollama Raw Response:\n", response.message.content, "\n")
 
-    return PartialCompanyList.model_validate_json(response.message.content)
+    structured_data = CompanyList.model_validate_json(response.message.content)
+
+    # Convert Pydantic model into a dictionary
+    return structured_data.companies[0].model_dump()
 
 @app.command()
 def process_csv(
     input_csv: Path = typer.Argument(..., help="Path to input CSV file"),
     output_csv: Path = typer.Argument(..., help="Path to output CSV file"),
-    batch_size: int = typer.Option(5, "--batch-size", "-b", help="Number of rows per request"),
     error_log: Path = typer.Option("error_log.txt", "--error-log", "-e", help="Path to error log file")
 ):
     """
-    Reads a CSV file, extracts structured data using Ollama in batches, 
+    Reads a CSV file, extracts structured data using Ollama, 
     and stores results in DuckDB before saving to a new CSV file.
     Only valid fields are saved; invalid ones are left empty.
     """
@@ -172,65 +133,45 @@ def process_csv(
         csv_reader = csv.reader(csvfile)
         headers = next(csv_reader)  # Skip header row
 
-        rows_buffer = []
         total_rows = sum(1 for _ in csv_reader)  # Count rows for tqdm
         csvfile.seek(0)  # Reset file pointer
         next(csv_reader)  # Skip header again
 
         with tqdm(total=total_rows, desc="Processing Rows", unit="row") as pbar:
-            def process_batch(rows):
-                """Processes a batch of rows."""
-                try:
-                    structured_data_batch = extract_data_from_batch(rows)
-
-                    for structured_data in structured_data_batch.companies:
-                        valid_data = {k: v for k, v in structured_data.model_dump().items() if v not in [None, "", "None"]}
-
-                        if valid_data:
-                            conn.execute("""
-                                INSERT INTO companies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, [
-                                valid_data.get("Company_Name", ""),
-                                valid_data.get("Company_Website", ""),
-                                valid_data.get("Company_Location", ""),
-                                valid_data.get("Company_Phone_Number", ""),
-                                valid_data.get("Email", ""),
-                                valid_data.get("LinkedIn_Link", ""),
-                                valid_data.get("Sector", ""),
-                                valid_data.get("Ticket_Size", ""),
-                                valid_data.get("X_Twitter_Account_Link", ""),
-                                valid_data.get("Funding_Round", ""),
-                                valid_data.get("Individual_or_Corporation", ""),
-                            ])
-                except ValidationError as e:
-                    log_error(f"Skipping batch due to validation error: {e}")
-                except Exception as e:
-                    log_error(f"Skipping batch due to unexpected error: {e}")
-
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = []
-                for row in csv_reader:
-                    if not any(row):
-                        continue
-                    rows_buffer.append(row)
-                    if len(rows_buffer) >= batch_size:
-                        futures.append(executor.submit(process_batch, rows_buffer))
-                        rows_buffer = []
+            for row in csv_reader:
+                if not any(row):  # Skip empty rows
                     pbar.update(1)
+                    continue
 
-                # Process any remaining rows
-                if rows_buffer:
-                    futures.append(executor.submit(process_batch, rows_buffer))
-                    pbar.update(len(rows_buffer))
+                try:
+                    structured_data = extract_data_from_row(row)
 
-                # Wait for all futures to complete
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except ValidationError as e:
-                        log_error(f"Error processing batch: {e}")
-                    except Exception as e:
-                        log_error(f"Error processing batch: {e}")
+                    structured_data["Company_Phone_Number"] = validate_phone_number(structured_data.get("Company_Phone_Number"))
+                    structured_data["LinkedIn_Link"] = validate_linkedin_url(structured_data.get("LinkedIn_Link"))
+                    structured_data["X_Twitter_Account_Link"] = validate_x_twitter_url(structured_data.get("X_Twitter_Account_Link"))
+
+                    valid_data = {k: v for k, v in structured_data.items() if v not in [None, "", "None"]}
+
+                    if valid_data:  # Only insert if valid data exists
+                        conn.execute("""
+                            INSERT INTO companies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, [
+                            valid_data.get("Company_Name", ""),
+                            valid_data.get("Company_Website", ""),
+                            valid_data.get("Company_Location", ""),
+                            valid_data.get("Company_Phone_Number", ""),
+                            valid_data.get("Email", ""),
+                            valid_data.get("LinkedIn_Link", ""),
+                            valid_data.get("Sector", ""),
+                            valid_data.get("Ticket_Size", ""),
+                            valid_data.get("X_Twitter_Account_Link", ""),
+                            valid_data.get("Funding_Round", ""),
+                            valid_data.get("Individual_or_Corporation", ""),
+                        ])
+                except Exception as e:
+                    log_error(f"Skipping row due to validation error: {e}\n")
+
+                pbar.update(1)
 
     # Save extracted data to a CSV file
     conn.execute(f"COPY companies TO '{output_csv}' (HEADER, DELIMITER ',')")
