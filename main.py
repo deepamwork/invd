@@ -79,18 +79,21 @@ def extract_data_from_row(row) -> Dict[str, Any]:
 
     prompt = f"""
     Extract the following structured information from the given data.
+    Ensure the output is a single JSON object with the specified fields.
     If a column is invalid or missing, leave it blank.
 
-    Headers: "Company Name", "Company Website", "Company Location", "Company Phone Number", "Email",
-    "LinkedIn Link", "Sector", "Ticket Size", "X Twitter Account Link", "Funding Round", "Individual or Corporation"
+    Headers: "Company_Name", "Company_Website", "Company_Location", "Company_Phone_Number", "Email",
+    "LinkedIn_Link", "Sector", "Ticket_Size", "X_Twitter_Account_Link", "Funding_Round", "Individual_or_Corporation"
 
     Data:
     {raw_data}
+
+    Output the result as a single JSON object with the specified fields.
     """
 
     response = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="deepseek-r1:latest",  
+        model="tinyllama:latest",  
         format=CompanyList.model_json_schema(),  # Request structured JSON output
     )
 
