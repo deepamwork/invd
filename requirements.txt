@@ -3,3 +3,4 @@ typer
 ollama
 pydantic
 tqdm
+pydantic[email]
